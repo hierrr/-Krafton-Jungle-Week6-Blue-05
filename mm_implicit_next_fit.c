@@ -62,6 +62,7 @@ team_t team = {
 
 // set heap_list
 static void *heap_listp = NULL;
+static void *last_bp = NULL; // set last_bp(next fit)
 
 // coalesce alloc or free blocks
 static void *mm_coalesce(void *bp)
@@ -95,6 +96,7 @@ static void *mm_coalesce(void *bp)
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0)); // reset next_ftr
         bp = PREV_BLKP(bp); // bp >> prev
     }
+    last_bp = bp; // last fit
     return (bp);
 }
 
@@ -103,7 +105,7 @@ static void *mm_extend_heap(size_t size)
 {
     char *bp = NULL;
 
-    if ((bp = mem_sbrk(size)) == (void *)-1) // size aligned
+    if ((bp = mem_sbrk(size)) == (void *)-1)
         return (NULL); // err: mem_sbrk failed(ran out of memory)
     PUT(HDRP(bp), PACK(size, 0)); // new block hdr
     PUT(FTRP(bp), PACK(size, 0)); // new block ftr
@@ -123,24 +125,25 @@ int mm_init(void)
     PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); // prlg ftr
     PUT(heap_listp + (3*WSIZE), PACK(0, 1)); // eplg hdr
     heap_listp += (2*WSIZE); // heap_listp >> prlg ftr
-    if (mm_extend_heap(CHUNKSIZE) == NULL) // set init heap size
+    if (mm_extend_heap(CHUNKSIZE / WSIZE) == NULL) // set init heap size
         return (-1); // err: extend heap failed
+    last_bp = heap_listp; // next fit
     return (0);
 }
 
-// first fit
+// next fit
 static void *mm_find_fit(size_t alloc_size)
 {
     void *bp = NULL;
 
-    bp = heap_listp;
+    bp = last_bp;
     while (GET_SIZE(HDRP(bp)))
     {
         if (!GET_ALLOC(HDRP(bp)) && (GET_SIZE(HDRP(bp)) >= alloc_size))
             return (bp);
         bp = NEXT_BLKP(bp);
     }
-    return (NULL); // err: no fit
+    return (NULL); //  err: no fit
 }
 
 static void mm_place(void *bp, size_t alloc_size)
@@ -176,15 +179,17 @@ void *mm_malloc(size_t size)
     if (size == 0)
         return (NULL); // err: alloc unavailable
     alloc_size = ALIGN(size) + DSIZE; // alloc_size = aligned size + hdr + ftr
-    if ((bp = mm_find_fit(alloc_size)) != NULL) // first fit found
+    if ((bp = mm_find_fit(alloc_size)) != NULL) // next fit found
     {
         mm_place(bp, alloc_size); // alloc at fit
+        last_bp = bp; // next fit
         return (bp);
     }
     extend_size = MAX(alloc_size, CHUNKSIZE); // no fit >> extend heap
     if ((bp = mm_extend_heap(extend_size)) == NULL)
         return (NULL); // err: mm_extend_heap failed(mem_sbrk failed(out of memory))
     mm_place(bp, alloc_size); // alloc at extended
+    last_bp = bp; // next fit
     return (bp);
 }
 
@@ -210,7 +215,7 @@ void *mm_realloc(void *ptr, size_t size)
     void *new = NULL;
     size_t cpy_size = 0;
 
-    size = ALIGN(size); // align size
+    size = ALIGN(size);
     old = ptr;
     new = mm_malloc(size);
     if (new == NULL)

@@ -42,6 +42,7 @@ team_t team = {
 // sg, db word and chunk size alignment
 #define WSIZE (4)
 #define DSIZE (8)
+#define INIT_CHUNKSIZE (1<<6)
 #define CHUNKSIZE (1<<12)
 // return max(x, y)
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -50,6 +51,7 @@ team_t team = {
 // read or write at addr(p)
 #define GET(p) (*(unsigned int *)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
+#define PUT_PTR(p, ptr) (*(unsigned int *)(p) = (unsigned int)(ptr))
 // get size or alloc from addr(p)
 #define GET_SIZE(p) (GET(p) & ~0x7)
 #define GET_ALLOC(p) (GET(p) & 0x1)
@@ -59,9 +61,92 @@ team_t team = {
 // get prev, next block addr from block ptr(bp)
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE)) // prev = curr - prev_size
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE((char *)(bp) - WSIZE)) // next = curr + curr_size
+// get prev, next addr in free_list(seg_list[i])
+#define PREV_PTR(ptr) ((char *)(ptr) + WSIZE)
+#define NEXT_PTR(ptr) ((char *)(ptr))
+// get prev, next addr in seg_list
+#define PREV(ptr) (*(char **)(PREV_PTR(ptr)))
+#define NEXT(ptr) (*(char **)(ptr))
+// init seg_list
+#define MAX_LIST (20)
 
 // set heap_list
 static void *heap_listp = NULL;
+// set seg_list
+static void *seg_list[MAX_LIST];
+
+// insert, delete in list
+static void mm_list_insert(void *ptr, size_t size)
+{
+    int i = 0;
+    void *sp = NULL; // search ptr
+    void *ip = NULL; // insert ptr
+
+    while ((i < MAX_LIST-1) && (size > 1))
+    {
+        size >>= 1; // find size
+        i++;
+    }
+    sp = seg_list[i]; // find at free_list in seg_list
+    while (sp && (size > GET_SIZE(HDRP(sp))))
+    {
+        ip = sp; // ip >> prev
+        sp = NEXT(sp); // sp >> next
+    }
+    if (ip && sp) // case 1: prev, next alloc
+    {
+        PUT_PTR(NEXT_PTR(ptr), sp); // ptr.next = next
+        PUT_PTR(PREV_PTR(sp), ptr); // next.prev = ptr
+        PUT_PTR(PREV_PTR(ptr), ip); // ptr.prev = prev
+        PUT_PTR(NEXT_PTR(ip), ptr); // prev.next = ptr
+    }
+    else if (ip && !sp) // case 2: prev alloc, next free
+    {
+        PUT_PTR(NEXT_PTR(ptr), NULL); // ptr.next = NULL
+        PUT_PTR(PREV_PTR(ptr), ip); // ptr.prev = prev
+        PUT_PTR(NEXT_PTR(ip), ptr); // prev.next = ptr
+    }
+    else if (!ip && sp) // case 3: prev free, next alloc
+    {
+        PUT_PTR(NEXT_PTR(ptr), sp); // ptr.next = next
+        PUT_PTR(PREV_PTR(sp), ptr); // next.prev = ptr
+        PUT_PTR(PREV_PTR(ptr), NULL); // ptr.prev = NULL
+        seg_list[i] = ptr; // seg_list[i].front = ptr
+    }
+    else // case 4: prev, next free
+    {
+        PUT_PTR(NEXT_PTR(ptr), NULL); // ptr.next = NULL
+        PUT_PTR(PREV_PTR(ptr), NULL); // ptr.prev = NULL
+        seg_list[i] = ptr; // seg_list[i].front = ptr
+    }
+}
+
+static void mm_list_delete(void *ptr)
+{
+    int i = 0;
+    size_t size = 0;
+
+    size = GET_SIZE(HDRP(ptr));
+    while ((i < MAX_LIST-1) && (size > 1))
+    {
+        size >>= 1; // find size
+        i++;
+    }
+    if (PREV(ptr) && NEXT(ptr)) // case 1: prev, next alloc
+    {
+        PUT_PTR(PREV_PTR(NEXT(ptr)), PREV(ptr)); // next.prev = prev
+        PUT_PTR(NEXT_PTR(PREV(ptr)), NEXT(ptr)); // prev.next = next
+    }
+    else if (PREV(ptr) && !NEXT(ptr)) // case 2: prev alloc, next free
+        PUT_PTR(NEXT_PTR(PREV(ptr)), NULL); // next.prev = NULL
+    else if (!PREV(ptr) && NEXT(ptr)) // case 3: prev free, next alloc
+    {
+        PUT_PTR(PREV_PTR(NEXT(ptr)), NULL); // next.prev = NULL
+        seg_list[i] = NEXT(ptr); // seg_list[i].front = next
+    }
+    else // case 4: prev, next free
+        seg_list[i] = NULL; // seg_list[i].front = NULL
+}
 
 // coalesce alloc or free blocks
 static void *mm_coalesce(void *bp)
@@ -74,15 +159,21 @@ static void *mm_coalesce(void *bp)
     next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
     size = GET_SIZE(HDRP(bp));
     if (prev_alloc && next_alloc) // case 1: prev, next alloc
-        return (bp);
-    else if (prev_alloc && !next_alloc) // case 2: prev alloc, next free >> curr + next
     {
+        return (bp);
+    }
+    if (prev_alloc && !next_alloc) // case 2: prev alloc, next free >> curr + next
+    {
+        mm_list_delete(bp);
+        mm_list_delete(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(NEXT_BLKP(bp))); // curr_size + next_size
         PUT(HDRP(bp), PACK(size, 0)); // reset curr_hdr
         PUT(FTRP(bp), PACK(size, 0)); // reset next_ftr
     }
     else if (!prev_alloc && next_alloc) // case 3: prev free, next alloc >> prev + curr
     {
+        mm_list_delete(bp);
+        mm_list_delete(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp))); // prev_size + curr_size
         PUT(FTRP(bp), PACK(size, 0)); // reset curr_ftr
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0)); // reset prev_hdr
@@ -90,11 +181,15 @@ static void *mm_coalesce(void *bp)
     }
     else // case 4: prev, next free >> prev + curr + next
     {
+        mm_list_delete(bp);
+        mm_list_delete(PREV_BLKP(bp));
+        mm_list_delete(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp))); // prev_size + curr_size + next_size
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0)); // reset prev_hdr
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0)); // reset next_ftr
         bp = PREV_BLKP(bp); // bp >> prev
     }
+    mm_list_insert(bp, size);
     return (bp);
 }
 
@@ -103,11 +198,12 @@ static void *mm_extend_heap(size_t size)
 {
     char *bp = NULL;
 
-    if ((bp = mem_sbrk(size)) == (void *)-1) // size aligned
+    if ((bp = mem_sbrk(size)) == (void *)-1)
         return (NULL); // err: mem_sbrk failed(ran out of memory)
     PUT(HDRP(bp), PACK(size, 0)); // new block hdr
     PUT(FTRP(bp), PACK(size, 0)); // new block ftr
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); // new block | eplg hdr
+    mm_list_insert(bp, size);
     return (mm_coalesce(bp)); // set all new block free
 }
 
@@ -116,6 +212,9 @@ static void *mm_extend_heap(size_t size)
  */
 int mm_init(void)
 {
+    int i = 0;
+    while (i < MAX_LIST)
+        seg_list[i++] = NULL;
     if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1)
         return (-1); // err: mem_sbrk failed(ran out of memory)
     PUT(heap_listp, 0); // alignment padding
@@ -123,7 +222,7 @@ int mm_init(void)
     PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1)); // prlg ftr
     PUT(heap_listp + (3*WSIZE), PACK(0, 1)); // eplg hdr
     heap_listp += (2*WSIZE); // heap_listp >> prlg ftr
-    if (mm_extend_heap(CHUNKSIZE) == NULL) // set init heap size
+    if (mm_extend_heap(INIT_CHUNKSIZE) == NULL) // set init heap size
         return (-1); // err: extend heap failed
     return (0);
 }
@@ -132,13 +231,22 @@ int mm_init(void)
 static void *mm_find_fit(size_t alloc_size)
 {
     void *bp = NULL;
+    int i = 0;
+    size_t search_size = 0;
 
-    bp = heap_listp;
-    while (GET_SIZE(HDRP(bp)))
+    search_size = alloc_size;
+    while (i < MAX_LIST)
     {
-        if (!GET_ALLOC(HDRP(bp)) && (GET_SIZE(HDRP(bp)) >= alloc_size))
-            return (bp);
-        bp = NEXT_BLKP(bp);
+        if ((i == MAX_LIST-1) || ((search_size <= 1) && seg_list[i]))
+        {
+            bp = seg_list[i];
+            while (bp && (alloc_size > GET_SIZE(HDRP(bp))))
+                bp = NEXT(bp);
+            if (bp)
+                return bp;
+        }
+        search_size >>= 1;
+        i++;
     }
     return (NULL); // err: no fit
 }
@@ -148,6 +256,7 @@ static void mm_place(void *bp, size_t alloc_size)
     size_t curr_size = 0;
 
     curr_size = GET_SIZE(HDRP(bp));
+    mm_list_delete(bp);
     if (curr_size - alloc_size > 2 * DSIZE) // rest_size >= hdr + ftr
     {
         PUT(HDRP(bp), PACK(alloc_size, 1)); // set new alloc block hdr
@@ -155,6 +264,7 @@ static void mm_place(void *bp, size_t alloc_size)
         bp = NEXT_BLKP(bp); // bp >> next
         PUT(HDRP(bp), PACK(curr_size - alloc_size, 0)); // set rest block hdr
         PUT(FTRP(bp), PACK(curr_size - alloc_size, 0)); // set rest block ftr
+        mm_list_insert(bp, (curr_size - alloc_size));
     }
     else
     {
@@ -176,7 +286,7 @@ void *mm_malloc(size_t size)
     if (size == 0)
         return (NULL); // err: alloc unavailable
     alloc_size = ALIGN(size) + DSIZE; // alloc_size = aligned size + hdr + ftr
-    if ((bp = mm_find_fit(alloc_size)) != NULL) // first fit found
+    if ((bp = mm_find_fit(alloc_size)) != NULL) // fit found
     {
         mm_place(bp, alloc_size); // alloc at fit
         return (bp);
@@ -198,6 +308,7 @@ void mm_free(void *ptr)
     size = GET_SIZE(HDRP(ptr)); // free block size
     PUT(HDRP(ptr), PACK(size, 0)); // hdr: alloc >> free
     PUT(FTRP(ptr), PACK(size, 0)); // ftr: alloc >> free
+    mm_list_insert(ptr, size);
     mm_coalesce(ptr);
 }
 
